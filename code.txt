@@ -1,0 +1,708 @@
+import os,sys
+import pdb
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.automap import automap_base
+from sqlalchemy import MetaData, inspect,and_,func, asc,or_,desc
+import datetime   
+import requests
+# import urllib.request as request
+# import requests as request
+import pytz
+import json
+# base_dir = os.path.dirname()
+parent_dir=os.path.abspath('..')
+# parent_dir=os.path.abspath('.')
+# pdb.set_trace()
+# utils_path = \
+#     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+#         os.path.dirname(os.path.abspath(__file__))))),"Seclogic",'Notification_Backend','utils')
+utils_path = \
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))),parent_dir,'utils')
+sys.path.insert(1,utils_path)
+from Connection import CyberqDbConnection,DbConnection
+from common import send_email_notification,send_mail_smtp,create_json,create_slack_json
+from websocket import create_connection
+webs_api = os.environ['WEBSOCKET_API']
+
+
+# models_path = \
+#     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+#         os.path.dirname(os.path.abspath(__file__))))),'Seclogic','Notification_Backend','send_email')
+# sys.path.insert(1, models_path)
+# pdb.set_trace()
+
+cyberq_db_conn = CyberqDbConnection()
+cyberq_engine = cyberq_db_conn.cyberq_engine()
+cybrq_Session = sessionmaker(bind=cyberq_engine)
+
+db_conn = DbConnection()
+engine = db_conn.engine()
+Session = sessionmaker(bind=engine)
+
+metadata = MetaData()
+
+def get_schema_name_(tenant_id):
+    metadata = MetaData()
+    metadata.reflect(cyberq_engine, schema = 'public')
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session() 
+    org_db = Base.classes.tOrgSchemas
+    schema = session.query(org_db).filter(org_db.tenant_id == tenant_id).first()
+    if schema:
+        schema_name = schema.schema_name
+        print(schema_name)
+        return schema_name
+    session.close()
+    db_conn.close()
+    return None
+
+def get_groups_data(tenant_id):
+    metadata = MetaData()
+    metadata.reflect(cyberq_engine, schema="public")
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session()
+    groups_data = []
+    environment_id_list = []
+    group_policy_list = []
+    group_db = Base.classes.tUserGroups
+    groups = session.query(group_db).filter(group_db.tenant_id == tenant_id)
+    for group in groups:
+        groups_dic = {}
+        environment_id_list_under = []
+        group_id = group.id
+        environment_data = group.environments_data
+        if environment_data == "All Environments":
+            environment_id_list.append(environment_data)
+            environment_id_list_under.append(environment_data)
+            
+        else:
+            for enironment in environment_data:
+                environment_id_list.append(enironment['id'])
+                environment_id_list_under.append(enironment['id'])
+        policy = group.policy
+        group_policy_list.append(policy)
+        groups_dic['id'] = group_id
+        groups_dic['group_name'] = group.group_name
+        groups_dic['environments_id'] = environment_id_list_under
+        groups_dic['policy'] = policy
+        groups_data.append(groups_dic)
+    return groups_data
+
+def get_user_groups_data(tenant_id):
+    metadata = MetaData()
+    metadata.reflect(cyberq_engine, schema="public")
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session()
+    user_groups_db = Base.classes.tUserTenants
+    user_groups_list = []
+    user_groups = session.query(user_groups_db).filter(user_groups_db.tenant_id == tenant_id)
+    for user_group in user_groups:
+        user_group_dic = {}
+        user_group_dic['groups'] = user_group.groups_id
+        user_group_dic['user'] = user_group.user_id
+        user_groups_list.append(user_group_dic)
+    return user_groups_list
+
+def get_user_group_by_group_id(group_id,user_groups_data):
+    user_id_list = []
+    for user_group in user_groups_data:
+        if group_id in user_group['groups']:
+            user_id_list.append(user_group['user'])
+    return user_id_list
+
+def get_group_env_policy(group_list,groups_data,user_groups_data):
+    policy_list = []
+    group_name = []
+    # user_id = []
+    group_data_list = []
+    for group in groups_data:
+        group_dic = {}
+        env_id_list = []
+        user_id = []
+        if group['id'] in group_list:
+            for i in group['environments_id']:
+                env_id_list.append(i)
+            group_dic['environment'] = env_id_list
+            policy_list.append(group['policy'])
+            group_dic['group_id'] = group['id']
+            group_dic['policy'] = group['policy']
+            group_name.append(group['group_name'])
+            group_dic['group_name'] = group['group_name']
+            users = get_user_group_by_group_id(group['id'],user_groups_data)
+            for user in users:
+                user_id.append(user)
+            group_dic['user_id'] = user_id
+            group_data_list.append(group_dic)
+    result = {}
+    result['environment'] = env_id_list
+    result['policy'] = policy_list
+    result['group_name'] = group_name 
+    # result['']     
+    return group_data_list
+
+def get_environments_data(tenant_id):
+    metadata = MetaData()
+    schema_name = get_schema_name_(tenant_id)
+    metadata.reflect(cyberq_engine, schema=schema_name)
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session()
+    master_account = Base.classes.tClient_MasterAccount
+    # accounts = session.query(master_account).filter(master_account.account_id.in_(environments_data))
+    environment_list = []
+    environment_list_id = []
+    environment_list_name = []
+    environment_list_tags = []
+    cloud_provider_list = []
+    child_event = []
+    all_accounts = session.query(master_account)
+    for account in all_accounts:
+        environment_dic = {}
+        environment_dic['id'] = account.account_id
+        environment_list_id.append(account.account_id)
+        environment_dic['name'] = account.environment_name
+        environment_dic['cloud_provider'] = account.cloud_provider
+        environment_list_name.append(account.environment_name)
+        if account.environment_tags == None:
+            environment_dic['tags'] = "-"
+        else:
+            environment_dic['tags'] = account.environment_tags
+        if type(environment_dic['tags'] == list):
+            for tag in environment_dic['tags']:
+                environment_list_tags.append(tag)
+        else:
+            environment_list_tags.append(environment_dic['tags'])
+        environment_list.append(environment_dic)
+        cloud_provider_list.append(account.cloud_provider)
+    result = {}
+    result['environment_list'] = environment_list
+    result['environment_list_id'] = environment_list_id
+    result['cloud_provider_list'] = cloud_provider_list
+    result['environment_list_name'] = environment_list_name
+    result['environment_list_tags'] = environment_list_tags
+    session.close()
+    db_conn.close()
+    return result
+    
+def group_environment(environments_id_list,all_environment):
+    environment_list = []
+    environment_list_id = []
+    cloud_provider_list = []
+    environment_list_name = []
+    environment_list_tags = []
+    for environment in all_environment['environment_list']:
+        if "All Environments" in environments_id_list:
+            if environment not in environment_list:
+                environment_list.append(environment)
+            if environment['id'] not in environment_list_id:
+                environment_list_id.append(environment['id'])
+            if environment['name'] not in environment_list_name:
+                environment_list_name.append(environment['name'])
+            if environment['cloud_provider'] not in cloud_provider_list:
+                cloud_provider_list.append(environment['cloud_provider'])
+            if environment['tags'] not in environment_list_tags:
+                for tag in environment['tags']:
+                    environment_list_tags.append(tag)
+                # environment_list_tags.append(environment['tags'])
+        if environment['id'] in environments_id_list:
+            if environment not in environment_list:
+                environment_list.append(environment)
+            if environment['id'] not in environment_list_id:
+                environment_list_id.append(environment['id'])
+            if environment['name'] not in environment_list_name:
+                environment_list_name.append(environment['name'])
+            if environment['cloud_provider'] not in cloud_provider_list:
+                cloud_provider_list.append(environment['cloud_provider'])
+            if environment['tags'] not in environment_list_tags:
+                for tag in environment['tags']:
+                    environment_list_tags.append(tag)
+                # environment_list_tags.append(environment['tags'])
+    group_env_result = {}
+    group_env_result['environment_list'] = environment_list
+    group_env_result['environment_list_id'] = environment_list_id
+    group_env_result['environment_list_name'] = environment_list_name
+    group_env_result['environment_list_tags'] = environment_list_tags
+    group_env_result['cloud_provider_list'] = cloud_provider_list
+    return group_env_result
+
+def get_queue_data():
+    metadata = MetaData()
+    metadata.reflect(engine, schema = 'public')
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    queue_db = Base.classes.Queue
+    session = Session()
+    queues = session.query(queue_db)
+    queue_list = []
+
+    for queue in queues:
+        queue_dic = {}
+        queue_dic['queue_id'] = queue.id
+        queue_dic['created_time'] = queue.created_time
+        queue_dic['master_event'] = queue.master_event
+        queue_dic['child_event'] = queue.child_event
+        queue_dic['user_email'] = queue.user_email
+        queue_dic['tenant_id'] = queue.sub_tenant_id
+        queue_dic['require_event_data'] = queue.require_event_data
+        queue_dic['logs_expansion_data'] = queue.logs_expansion_data
+        queue_list.append(queue_dic)
+    print(queue_list)
+    session.close()
+    db_conn.close()
+    return queue_list
+
+def delete_queue(queue_id):
+    metadata = MetaData()
+    metadata.reflect(engine, schema = 'public')
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    queue_db = Base.classes.Queue
+    session = Session()
+    queues = session.query(queue_db).filter_by(id = queue_id).delete()
+    session.commit()
+    session.close()
+    db_conn.close()
+    return ("Queue deleted")
+
+def get_notification_data(master_event,child_event,tenant_id):
+    schema_name = get_schema_name_(tenant_id)
+    metadata.reflect(cyberq_engine, schema=schema_name)
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session() 
+    notification_db = Base.classes.tNotification
+    notification_list = []
+    user_list = []
+    all_environment_data = get_environments_data(tenant_id)
+    all_groups_data = get_groups_data(tenant_id)
+    all_user_group_data = get_user_groups_data(tenant_id)
+    notification_data = session.query(notification_db).filter(and_(notification_db.event == master_event,notification_db.child_event.contains([child_event])))
+    for notification in notification_data:
+        notification_dic = {}
+        notification_dic['notification_id'] = notification.id
+        notification_dic['notification_name'] = notification.name
+        notification_dic['notification_created_time'] = notification.created_time
+        notification_dic['master_event'] = notification.event
+        notification_dic['child_event'] = notification.child_event
+        notification_dic['channels'] = notification.channel
+        notification_dic['require_event_data'] = notification.child_event_option
+        notification_dic['groups_name'] = notification.groups_name
+        notification_dic['users'] = notification.users
+        group_list = notification.groups
+        groups_data = get_group_env_policy(group_list,all_groups_data,all_user_group_data)
+        groups_data_internal_list = []
+        for group in groups_data:
+            groups_data_internal = {}
+            environments_data = group['environment']
+            groups_policy = group['policy']
+            group_env = group_environment(environments_data,all_environment_data)
+            groups_data_internal['group_id'] = group['group_id']
+            groups_data_internal['group_name'] = group['group_name']
+            groups_data_internal['policy'] =  groups_policy
+            groups_data_internal['environments'] =  group_env['environment_list']
+            groups_data_internal['user_id'] = group['user_id']
+            groups_data_internal['environment_id'] = group_env['environment_list_id']
+            groups_data_internal['environment_name'] = group_env['environment_list_name']
+            groups_data_internal['environment_tags'] = group_env['environment_list_tags']
+            groups_data_internal['cloud_provider'] = group_env['cloud_provider_list']
+            groups_data_internal_list.append(groups_data_internal)
+        notification_dic['groups_data'] = groups_data_internal_list
+        notification_list.append(notification_dic)
+
+    result = []
+    result_dic = {}
+    result_dic['notification_data'] = notification_list
+    result_dic['users_list'] = user_list
+    result.append(result_dic)
+    print(result)
+    session.close()
+    db_conn.close()
+    return result
+
+def get_non_compliant_rules_data(services,risks,severities,tenant_id):
+    schema_name = get_schema_name_(tenant_id)
+    metadata.reflect(cyberq_engine, schema=schema_name)
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session() 
+    rules_db = Base.classes.tClient_Rule_Expansion
+    non_compliant_rules_data = {}
+    service_list = []
+    severity_list = []
+    risk_list = []
+    for service in services:
+        service_list.append(service.lower())
+    for risk in risks:
+        if risk == "identity":
+            risk_list.append("User")
+        if risk == "network":
+            risk_list.append("Network")
+        if risk == "data":
+            risk_list.append("Data")
+    for servrity in severities:
+        if servrity == "critical":
+            severity_list.append("CRITICAL")
+        if servrity == "high":
+            severity_list.append("HIGH")
+        if servrity == "medium":
+            severity_list.append("MEDIUM")
+        if servrity == "low":
+            severity_list.append("LOW")
+    sort_objects = session.query(rules_db.scan_id).order_by(rules_db.id.desc()).first()
+    latest_scan_id = sort_objects.scan_id
+    # service_rules_count = session.query(rules_db).filter(rules_db.service.in_(service)).count()
+    # risk_rules_count =  session.query(rules_db).filter(and_(rules_db.risk_category.in_(risk)),rules_db.service.in_(service)).count()
+    rules_count = session.query(rules_db).filter(and_(rules_db.risk_category.in_(risk_list)),rules_db.service.in_(service_list),
+                                rules_db.severity.in_(severity_list),rules_db.evaluation == "non-compliant",rules_db.scan_id == latest_scan_id).count()
+    non_compliant_rules_data['service'] =  service_list
+    non_compliant_rules_data['risk'] = risk_list
+    non_compliant_rules_data['severity'] = severity_list
+    non_compliant_rules_data['rules_count'] = rules_count
+    session.close()
+    db_conn.close()
+    return non_compliant_rules_data
+
+def get_user_data(user_id_list):
+    metadata = MetaData()
+    metadata.reflect(cyberq_engine, schema="public")
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session()
+    user_db = Base.classes.seclogic_users
+    user_data = session.query(user_db).filter(and_(user_db.id.in_(user_id_list),user_db.is_active == True))
+    users_email_data = []
+    for user in user_data:
+        user_email_data_dic = {}
+        user_email_data_dic['user_id'] = user.id
+        user_email_data_dic['user_name'] = user.name
+        user_email_data_dic['user_email'] = user.email
+        users_email_data.append(user_email_data_dic)
+    session.close()
+    db_conn.close()
+    return users_email_data
+
+def get_channel_json_key(master_event,child_event,sub_child):
+    metadata = MetaData()
+    metadata.reflect(cyberq_engine, schema="public")
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session()
+    channel_json_db = Base.classes.tNotificationJsonData
+    if sub_child == None:
+        json_data = session.query(channel_json_db).filter(and_(channel_json_db.channel == "SLACK",channel_json_db.master_event == master_event,channel_json_db.child_event == child_event)).first()
+    else:
+        json_data = session.query(channel_json_db).filter(and_(channel_json_db.channel == "SLACK",channel_json_db.master_event == master_event,channel_json_db.child_event == child_event,channel_json_db.sub_child_event == sub_child)).first()
+    json_key = json_data.test_json_keys
+    json.dumps(json_key)
+    session.close()
+    db_conn.close()
+    return json_key
+
+def get_slack_webhook_url(tenant_id):
+    metadata = MetaData()
+    # schema_name = get_schema_name_(request, tenant_id)
+    metadata.reflect(cyberq_engine, schema="public")
+    Base = automap_base(metadata=metadata)
+    Base.prepare()
+    session = cybrq_Session() 
+    url = None
+    webhook_db = Base.classes.tClient_SlackWebhook
+    tenant_webhook = session.query(webhook_db).filter_by(tenant_id = tenant_id).first()
+    if tenant_webhook:
+        url = tenant_webhook.webhook_url
+    session.close()
+    db_conn.close()
+    return url
+
+def send_email():
+    queues = get_queue_data()
+    for queue in queues:
+        master_event = queue['master_event']
+        child_event = queue['child_event']
+        tenant_id = queue['tenant_id']
+        queue_id = queue['queue_id']
+        queue_require_event_data  = queue['require_event_data']
+        logs_expansion_data = queue['logs_expansion_data']
+        template_id = queue_require_event_data['template_id']
+        slack_webhook_url = get_slack_webhook_url(tenant_id)
+        try:
+            tenant_webs_api = webs_api + str(tenant_id)
+            print("=========",tenant_webs_api)
+            print(master_event)
+            print(child_event)
+            print(tenant_id)
+            all_notification_data = get_notification_data(master_event,child_event,tenant_id)
+            send_notification_data = all_notification_data[0]['notification_data']
+            notification_list = []
+            for notification in send_notification_data:
+                # if not notification['channels']:
+                #     continue
+                print("******************************")
+                user_status_list = []
+                if notification['master_event'] == "Non Compliant Rules":
+                    require_event_data = notification['require_event_data']
+                    risk=require_event_data[0]['Risk']
+                    service=require_event_data[0]['Service']
+                    severity=require_event_data[0]['Severity']
+                    non_compliant_rules = get_non_compliant_rules_data(service,risk,severity,tenant_id)
+                    queue_require_event_data['non_compliant_service'] = non_compliant_rules['service']
+                    queue_require_event_data['non_compliant_risk'] = non_compliant_rules['risk']
+                    queue_require_event_data['non_compliant_severity'] = non_compliant_rules['severity']
+                    queue_require_event_data['non_compliant_rule_count'] = str(non_compliant_rules['rules_count'])
+                    logs_expansion_data['Service'] = non_compliant_rules['service']
+                    logs_expansion_data['Risk'] = non_compliant_rules['risk']
+                    logs_expansion_data['Severity'] = non_compliant_rules['severity']
+                    logs_expansion_data['Total Non Compliant Rules'] = str(non_compliant_rules['rules_count'])
+                for group in notification['groups_data']:
+                    print("=============================")
+                    mail_json = create_json(
+                        # Full_Name = os.environ['Full_Name'],
+                        # Admin_EmailID = os.environ['ADMIN_ID'],
+                        # Group_Name = group['group_name'],
+                        # Group_Policy = group['policy'],
+                        # Cloud_Provider = group["cloud_provider"],
+                        # Environment_Name = group['environment_name'],
+                        # Environment_Primary_Tag = group['environment_tags'],
+                        # Environment_id = group['environment_id'],
+                        Cloud_Provider = queue_require_event_data.get("cloud_provider",None),
+                        Environment_Name = queue_require_event_data.get("environment_name",None),
+                        Environment_Primary_Tag = queue_require_event_data.get("environment_tags",None),
+                        Environment_id = queue_require_event_data.get("environment_id",None),
+                        Generated_by_email_id=queue_require_event_data.get("genarated_by_email",None),
+                        Generated_by_full_name = queue_require_event_data.get("genarated_by_name",None),
+                        # login_url=os.environ['ACCOUNT_LOGIN_URL'],
+                        login_url=os.environ['ACCOUNT_LOGIN_URL'],
+                        Subject = queue_require_event_data.get("subject",None),
+                        Exception_Name = queue_require_event_data.get("exception_name",None),
+                        Scan_Type = queue_require_event_data.get("scan_type",None),
+                        Scan_ID = queue_require_event_data.get("scan_id",None),
+                        Scan_Start_Time = queue_require_event_data.get("scan_start_time",None),
+                        Status = queue_require_event_data.get("status",None),
+                        # Event_Source = queue_require_event_data.get("event_source",None),
+                        Scan_End_Time = queue_require_event_data.get("scan_end_time",None),
+                        Reason_of_Failure = queue_require_event_data.get("error",None),
+                        Created_Date = queue_require_event_data.get("created_date",None),
+                        Master_Rule_ID = queue_require_event_data.get("master_rule_id",None),
+                        Master_RuleID = queue_require_event_data.get("rule_id",None),
+                        Rule_Description = queue_require_event_data.get("rule_description",None),
+                        Revoked_Date = queue_require_event_data.get("revoked_date",None),
+                        Edited_Date = queue_require_event_data.get("edited_date",None),
+                        Expired_Date = queue_require_event_data.get("expired_date",None),
+                        Rule_Name = queue_require_event_data.get("rule_name",None),
+                        Enabled_Date = queue_require_event_data.get("enabled_date",None),
+                        # Group_Name = queue_require_event_data.get("group_name",None),
+                        Disabled_Date = queue_require_event_data.get("disabled_date",None),
+                        Email_ID = queue_require_event_data.get("email_id",None),
+                        User_Name = queue_require_event_data.get("user_name",None),
+                        Rule_ID = queue_require_event_data.get("rule_id",None),
+                        count_of_non_complaint_rules_for_which_notification_is_created = queue_require_event_data.get("non_compliant_rule_count",None),
+                        Risk = queue_require_event_data.get("non_compliant_risk",None),
+                        severity = queue_require_event_data.get("non_compliant_severity",None),
+                        Service_Name = queue_require_event_data.get("non_compliant_service",None),
+                        Generated_by_Group_Name = group['group_name'],
+                        Generated_by_Group_Policy = group['policy'],
+                        Onboarded_by_EmailID=queue_require_event_data.get("onboarded_by_email",None),
+                        Onborded_by_name=queue_require_event_data.get("onboarded_by_name",None),
+                        removed_by_EmailID=queue_require_event_data.get("removed_by_email",None),
+                        removed_by_Full_Name=queue_require_event_data.get("removed_by_name",None),
+                        Created_by_full_name=queue_require_event_data.get("created_by_full_name",None),
+                        Created_by_Email_ID=queue_require_event_data.get("created_by_email_id",None),
+                        Created_by_Group_Name = group['group_name'],
+                        Created_by_Group_Policy = group['policy'],
+                        Edited_by_name=queue_require_event_data.get("edited_by_full_name",None),
+                        Edited_by_Email_ID=queue_require_event_data.get("edited_by_email_id",None),
+                        Edited_by_Group_Name = group['group_name'],
+                        Edited_by_Group_Policy = group['policy'],
+                        Revoked_by_full_name=queue_require_event_data.get("revoked_by_full_name",None),
+                        Revoked_by_email_id=queue_require_event_data.get("revoked_by_email_id",None),
+                        Revoked_by_Group_Name = group['group_name'],
+                        Revoked_by_Group_Policy = group['policy'],
+                        Enabled_by_name=queue_require_event_data.get("enabled_by_full_name",None),
+                        Enabled_by_Email_ID=queue_require_event_data.get("enabled_by_email_id",None),
+                        Enabled_by_Group_Name = group['group_name'],
+                        Enabled_by_Group_Policy = group['policy'],
+                        Disabled_by_name=queue_require_event_data.get("disabled_by_full_name",None),
+                        Disabled_by_Email_ID=queue_require_event_data.get("disabled_by_email_id",None),
+                        Disabled_by_Group_Name = group['group_name'],
+                        Disabled_by_Group_Policy = group['policy'],
+                        # New_Group_Name=queue_require_event_data.get("new_group_name",None),
+                        # Created_by_Email_ID=queue_require_event_data.get("created_by_email_id",None),
+                        New_Group_Name=queue_require_event_data.get("new_group_name",None),
+                        # Created_by_Email_ID=queue_require_event_data.get("created_by_email_id",None),
+                        Deleted_Group_Name=queue_require_event_data.get("deleted_group_name",None),
+                        Deleted_by_Email_ID=queue_require_event_data.get("deleted_by_email_id",None),
+                        Edited_Group_Name=queue_require_event_data.get("edited_group_name",None),
+                        # Edited_by_Email_ID=queue_require_event_data.get("edited_by_email_id",None),
+                        User_Group_Name=queue_require_event_data.get("user_group_name",None),
+                        User_Email=queue_require_event_data.get("user_email",None),
+                        created_by_Email_ID=queue_require_event_data.get("created_by_email_id",None),
+                        edited_by_Email_ID=queue_require_event_data.get("edited_by_email_id",None),
+                        removed_by_Email_ID=queue_require_event_data.get("removed_by_email_id",None),
+                        Generated_by_Full_Name = queue_require_event_data.get("genarated_by_name",None),
+                        Event_Date = queue_require_event_data.get("event_date",None),
+                        Event_Source = queue_require_event_data.get("event_source",None),
+                        Event_Action = queue_require_event_data.get("event_action",None),
+                        Resource_ID = queue_require_event_data.get("resource_id",None),
+                        Resource_Type = queue_require_event_data.get("resource_type",None),
+                        Principal_ARN = queue_require_event_data.get("principal_arn",None),
+                        Evaluation = queue_require_event_data.get("evaluation",None),
+                        Result = queue_require_event_data.get("result",None),
+                    )
+                    new_dict = {
+                        key: value for key, value in mail_json.items()
+                        if value is not None
+                    }
+                    remove_spsce_dict = {
+                        key.replace("_"," "): value for key, value in new_dict.items()
+                    }
+                    # for key,value in new_dict.items():
+                    #     new_key = key.replace("_"," ")
+                    #     del new_dict[key] # Deleting Previous Key
+                    #     new_dict[new_key] = value # Adding Modified key
+                    # new_d = {k.replace("_", " "): v for k, v in new_dict.items()}
+                    # users_data = get_user_data(group['user_id'])
+                    users_data = get_user_data(notification['users'])
+                    print("========MAIL_JSON=====",mail_json)
+                    print("========Event====",master_event)
+                    print("========Child Event===",child_event)
+                    print("========Tenant=====",tenant_id)
+                    print("=======",users_data,"=========")
+                    print("======Group_Name=======",group['group_name'])
+                    print("===========Require Event Data======",queue_require_event_data)
+                    print("=============notification channels=======",notification['channels'])
+                    if 'Email' in notification['channels']:
+                        for user_data in users_data:
+                            print("--------------------------")
+                            user_email = user_data['user_email']
+                            print(user_email)
+                            mail_json['Full_Name'] = user_data['user_name']
+                            print(mail_json)
+                            print(user_email)
+                            mail_response = send_email_notification(SENDGRID_API_KEY=os.environ['SENDGRID_API_KEY'],from_email=os.environ['ADMIN_ID'],to_emails = user_email,template_data = mail_json,template_id = template_id)
+                            mail_status = "fail"
+                            try:
+                                if "error" in mail_response.keys():
+                                    mail_status = 'fail'
+                            except:
+                                mail_status = "success"
+                            status_json = {
+                                "user_id":user_data['user_id'],
+                                "user_name":user_data['user_name'],
+                                "status":mail_status
+                            }
+                            user_status_list.append(status_json)
+                    print("----------------")
+                    if 'Slack' in notification['channels']:
+                        print("Enter IN SLACk")
+                        try:
+                            if master_event == "Scan":
+                                sub_child = remove_spsce_dict['Scan Type']
+                            else:
+                                sub_child = None
+                            print("1111111111111")
+                            slak_json_key = get_channel_json_key(master_event,child_event,sub_child)
+                            print("222222222222222")
+                            slack_json_data = create_slack_json(remove_spsce_dict,slak_json_key)
+                            # pdb.set_trace()
+                            # slack_webhook_url = 'https://hooks.slack.com/services/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'
+                            print("3333333333333333")
+                            # webhook = slack_webhook_url
+                            # slack_webhook_url = 'https://hooks.slack.com/services/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'
+                            print("4444444444444444")
+                            data_json = json.dumps(slack_json_data)
+                            print("55555555555555555")
+                            if slack_webhook_url:
+                                response = requests.post(slack_webhook_url, data=data_json)
+                            print("666666666666666666")
+                            if response.status_code != 200:
+                                raise ValueError(
+                                    'Request to slack returned an error %s, the response is:\n%s'
+                                    % (response.status_code, response.text)
+                                )
+                            print("SUCCESS")
+                        except Exception as e:
+                            print(e)
+                    print("***********************")
+                print("END")
+                metadata = MetaData()
+                schema_name = get_schema_name_(tenant_id)
+                metadata.reflect(cyberq_engine, schema=schema_name)
+                Base = automap_base(metadata=metadata)
+                Base.prepare()
+                session = cybrq_Session()
+                logs_db = Base.classes.tNotification_Logs
+                created_on = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f%z') 
+                notification_logs_data = logs_db(
+                    notification_id = notification['notification_id'],
+                    users_status = user_status_list,
+                    read_status = False,
+                    event = master_event,
+                    channels = notification['channels'],
+                    child_events = child_event,
+                    notification_data = notification,
+                    created_time = created_on,
+                    logs_expansion_data = [logs_expansion_data],
+                    groups_data = group,
+                    environment_id = group['environment_id'],
+                    created_date = datetime.datetime.now().date().strftime('%Y-%m-%d'),
+                )
+                data = dict(notification_logs_data.__dict__)
+                data.pop('_sa_instance_state', None)
+                tmp = session.add(notification_logs_data)
+                try:
+                    session.flush()
+                    session.commit()
+                    notification_list.append(notification['notification_id'])
+                    if len(notification_list) == len(send_notification_data):
+                        delete_queue(queue_id)
+                    notification_update = {
+                        "id": notification_logs_data.id,
+                        "status":False,
+                        "event": master_event,
+                        "child_event": child_event,
+                        "timestamp": created_on,
+                        "name":notification['notification_name']
+                    }
+                    notification_update_dic = {"notification_data":notification_update}
+                    text_data = json.dumps(notification_update_dic)
+                    ws = create_connection(tenant_webs_api)
+                    # ws.send({"message":json.dumps(notification_update_dic)})
+                    ws.send(text_data)
+                    if True:
+                        result =  ws.recv()
+                        print ("Received '%s'" % result)
+                except Exception as e:
+                    print(e)
+                    print('notification_logs not saved')
+                    # Logs.objects.create(notification_id = notification['notification_id'],group_id = group['group_id'],status = status_json)
+            delete_queue(queue_id)
+        except Exception as e:
+            print(e)
+            continue
+    try:
+        ws.close()
+    except:
+        pass
+    session.close()
+    db_conn.close()
+    return ("Notification sent successfully")
+
+
+
+# ws.send('{"message": "Testing by code"}')
+
+# while True:
+#     result =  ws.recv()
+#     print ("Received '%s'" % result)
+
+# ws.close()
+# get_queue_data()
+# get_schema_name_(1)
+# get_notification_data("Group","Create",1)
+# get_user_groups_data(1)
+send_email()
+# delete_queue(3)
